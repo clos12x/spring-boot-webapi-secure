@@ -12,9 +12,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  JAVA_VERSION: '25'
+  JAVA_VERSION: '21'
   MAVEN_OPTS: '-Xmx2g'
-  SKIP_SCA: 'false'  # Set to 'true' to skip SCA (Dependency-Check) step and moving to nightly
 
 jobs:
   # ------------------------------------------------------------------
@@ -23,11 +22,12 @@ jobs:
   build-and-test:
     name: Build & Test
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # Needed for Sonar / CodeQL history
+          fetch-depth: 0
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
@@ -68,10 +68,12 @@ jobs:
   sast-codeql:
     name: SAST - CodeQL
     runs-on: ubuntu-latest
+
     permissions:
       security-events: write
       contents: read
       actions: read
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -100,12 +102,15 @@ jobs:
           category: "/language:java"
 
   # ------------------------------------------------------------------
-  # 3. Software Composition Analysis (SCA) - Dependency vulnerabilities
+  # 3. SCA
+  # Dependency-Check se ejecutará en el workflow Nightly.
+  # Se mantiene aquí desactivado para que el CI de feature sea más rápido.
   # ------------------------------------------------------------------
   sca-dependency-check:
     name: SCA - OWASP Dependency-Check
     runs-on: ubuntu-latest
-    if: false  # Skip this job if SKIP_SCA is set to 'true'
+    if: false
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -120,24 +125,25 @@ jobs:
       - name: Run OWASP Dependency-Check
         run: |
           mvn -B org.owasp:dependency-check-maven:check \
-              -DfailBuildOnCVSS=7 \
-              -DsuppressionFile=dependency-check-suppressions.xml || true
-        # Remove "|| true" once you have suppressions in place and want hard fails
+              -DfailBuildOnCVSS=7
 
       - name: Upload Dependency-Check report
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: dependency-check-report
-          path: target/dependency-check-report.html
+          path: |
+            target/dependency-check-report.html
+            target/dependency-check-report.json
           retention-days: 14
 
   # ------------------------------------------------------------------
-  # 4. Optional: SpotBugs + PMD (static analysis)
+  # 4. Static Analysis - SpotBugs + PMD
   # ------------------------------------------------------------------
   static-analysis:
-    name: Static Analysis (SpotBugs + PMD)
+    name: Static Analysis - SpotBugs + PMD
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -149,11 +155,20 @@ jobs:
           distribution: 'temurin'
           cache: maven
 
-      - name: Run SpotBugs & PMD
+      - name: Compile project
+        run: mvn -B clean compile
+
+      - name: Run SpotBugs
         run: |
-          mvn -B clean compile \
-              com.github.spotbugs:spotbugs-maven-plugin:check \
-              org.apache.maven.plugins:maven-pmd-plugin:check || true
+          mvn -B \
+              com.github.spotbugs:spotbugs-maven-plugin:4.10.4.1:spotbugs \
+              -Dspotbugs.xmlOutput=true \
+              -Dspotbugs.htmlOutput=true
+
+      - name: Run PMD
+        continue-on-error: true
+        run: |
+          mvn -B org.apache.maven.plugins:maven-pmd-plugin:pmd
 
       - name: Upload SpotBugs / PMD reports
         uses: actions/upload-artifact@v4
@@ -161,33 +176,51 @@ jobs:
         with:
           name: static-analysis-reports
           path: |
-            target/spotbugsXml.xml
+            target/spotbugs*.xml
+            target/reports/spotbugs.html
             target/pmd.xml
+            target/site/pmd.html
+          if-no-files-found: warn
           retention-days: 7
 
   # ------------------------------------------------------------------
-  # 5. Quality Gate summary (optional - fails the workflow if critical issues)
+  # 5. Quality Gate
   # ------------------------------------------------------------------
   quality-gate:
     name: Quality Gate
     runs-on: ubuntu-latest
-    needs: [build-and-test, sast-codeql, sca-dependency-check]
+    needs:
+      - build-and-test
+      - sast-codeql
+      - static-analysis
     if: always()
+
     steps:
       - name: Check previous job results
         run: |
-          echo "Build & Test: ${{ needs.build-and-test.result }}"
-          echo "CodeQL:       ${{ needs.sast-codeql.result }}"
-          echo "SCA:          ${{ needs.sca-dependency-check.result }}"
+          echo "=========================================="
+          echo "          DEVSECOPS QUALITY GATE"
+          echo "=========================================="
 
-          if [[ "${{ needs.build-and-test.result }}" == "failure" ]]; then
+          echo "Build & Test:     ${{ needs.build-and-test.result }}"
+          echo "CodeQL:           ${{ needs.sast-codeql.result }}"
+          echo "Static Analysis:  ${{ needs.static-analysis.result }}"
+
+          if [[ "${{ needs.build-and-test.result }}" != "success" ]]; then
             echo "::error::Build or tests failed"
             exit 1
           fi
 
-          if [[ "${{ needs.sast-codeql.result }}" == "failure" ]]; then
-            echo "::error::CodeQL found high-severity security issues"
+          if [[ "${{ needs.sast-codeql.result }}" != "success" ]]; then
+            echo "::error::CodeQL security analysis failed"
             exit 1
           fi
 
-          echo "Quality gate passed"
+          if [[ "${{ needs.static-analysis.result }}" != "success" ]]; then
+            echo "::error::SpotBugs/static analysis failed"
+            exit 1
+          fi
+
+          echo "=========================================="
+          echo "QUALITY GATE PASSED"
+          echo "=========================================="
